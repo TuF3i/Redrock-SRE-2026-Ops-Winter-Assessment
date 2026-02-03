@@ -4,6 +4,13 @@
 BACKUP_DIR="/tmp/network_backup_$(date +%Y%m%d_%H%M%S)"
 ROLLBACK_COMMANDS=()
 
+# 计时器服务变量
+SCRIPT_NAME="network-check"
+SERVICE_FILE="/etc/systemd/system/${SCRIPT_NAME}.service"
+TIMER_FILE="/etc/systemd/system/${SCRIPT_NAME}.timer"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+
 # 设置错误处理
 trap 'execute_rollback "脚本被中断"' INT TERM
 trap 'if [[ $? -ne 0 && ${#ROLLBACK_COMMANDS[@]} -gt 0 ]]; then execute_rollback "脚本执行失败"; fi' EXIT
@@ -253,6 +260,15 @@ function checkEnv {
         fi
     fi
 
+    # 检查UFW是否存在
+    if which ufw &>/dev/null; then
+        logger -l INFO "check ufw success"
+    else
+        logger -l WARNING "no ufw command detect in the system, installing..."
+        apt-get install ufw -y &>/dev/null
+        addRollback "apt-get remove --purge -y ufw &>/dev/null || true"
+    fi
+
     logger -l SUCCESS "enveriment check pass!"
     return 0
 }
@@ -343,11 +359,319 @@ function setDHCPMode {
 }
 
 function setStaticMode {
+    local device="$1"
+    # 开始static配置
+    local connection_name="$1-static"
+    # 删除现有 eth0 连接（如果存在）
+    if nmcli connection show $device &>/dev/null; then
+        logger -l INFO "Trying to delete current device: $device"
+        nmcli connection delete $device
+    fi
+    if nmcli connection show "$connection_name" &>/dev/null; then
+        logger -l INFO "Trying to delete current connection: $connection_name"
+        nmcli connection delete "$connection_name" 2>/dev/null || true
+    fi
+    # 创建新的 STATIC 连接
+    logger -l INFO "Creating new connection STATIC for $device"
+    nmcli connection add \
+        type ethernet \
+        ifname $device \
+        con-name "$connection_name" \
+        connection.autoconnect yes \
+        connection.autoconnect-priority 0 \
+        ipv4.method manual \
+        ipv4.addresses 172.22.146.150/24 \
+        ipv4.gateway 172.22.146.1 \
+        ipv4.dns "172.22.146.53,172.22.146.54" \
+        ipv4.ignore-auto-dns yes \
+        ipv4.ignore-auto-routes no \
+        ipv4.may-fail yes \
+        ipv6.method auto \
+        ipv6.dhcp-timeout 30 \
+        ipv6.ip6-privacy 0
+    # 激活新的静态连接
+    logger -l INFO "activing new connection STATIC for $device"
+    # 先断开设备
+    nmcli device disconnect $device 2>/dev/null
+    # 启用新连接
+    if nmcli connection up "$connection_name"; then
+        logger -l SUCCESS "successfully actived new connection STATIC for $device"
+    else
+        logger -l CRITICAL "failed to active new connection STATIC for $device, rolling back..."
+        return 1
+    fi
+    
+    # 等待配置生效
+    sleep 3
+    
+    # 验证配置
+    if ! ip addr show "$device" | grep -q "inet 172.22.146.150"; then
+        logger -l WARNING "waiting for static configuration..."
+        sleep 5
+        
+        if ! ip addr show "$device" | grep -q "inet 172.22.146.150"; then
+            logger -l WARNING "static configuration fail"
+            return 1
+        fi
+    fi
+    
+    # 验证网关配置
+    if ! ip route | grep -q "default via 172.22.146.1"; then
+        logger -l WARNING "gateway configuration may not be correct"
+    fi
+    
+    # 验证DNS配置
+    if ! grep -q "172.22.146.53" /etc/resolv.conf 2>/dev/null && \
+       ! nmcli connection show "$connection_name" | grep -q "172.22.146.53"; then
+        logger -l WARNING "DNS configuration may not be correct"
+    fi
+
+    logger -l SUCCESS "successfully switched to STATIC Mode for $device"
+    return 0
+}
+
+function setStaticUfw {
+    logger -l INFO "Starting static network firewall configuration..."
+    # 重置 UFW
+    logger -l INFO "Resetting UFW to default state..."
+    ufw --force reset
+    # 设置默认策略：拒绝所有出站连接
+    logger -l INFO "Setting default policies: deny all outgoing..."
+    ufw default deny outgoing
+     # 保持入站允许
+    ufw default allow incoming
+    # 允许本地回环
+    logger -l INFO "Allowing loopback interface..."
+    ufw allow out on lo
+    ufw allow in on lo
+    # 允许同一内网网段 172.22.146.0/24
+    logger -l INFO "Allowing same subnet: 172.22.146.0/24..."
+    ufw allow out to 172.22.146.0/24
+    ufw allow in from 172.22.146.0/24
+    # 允许内部网络 172.16.0.0/12
+    logger -l INFO "Allowing internal network: 172.16.0.0/12..."
+    ufw allow out to 172.16.0.0/12
+    ufw allow in from 172.16.0.0/12
+    # 允许已建立的连接
+    logger -l INFO "Allowing established connections..."
+    ufw allow out established
+    logger -l INFO "Enabling UFW..."
+    # 建立回滚
+    addRollback "setDHCPUfw &>/dev/null || true"
+    # 启用UFW
+    if ufw --force enable; then
+        logger -l SUCCESS "static firewall enabled successfully"
+    else
+        logger -l CRITICAL "Failed to enable UFW"
+        return 1
+    fi
+}
+
+function setDHCPUfw {
+    logger -l INFO "Resetting firewall to default (dhcp) state..."
+    
+    ufw --force reset
+    ufw default allow outgoing
+    ufw default allow incoming
+    ufw --force disable
+    
+    logger -l SUCCESS "dhcp firewall enabled successfully"
+}
+
+function cidr2netmask() {
+   local cidr=$1
+   local mask=""
+   local full_octets=$((cidr / 8))
+   local partial_octet=$((cidr % 8))
+   
+   for ((i=0; i<4; i++)); do
+       if [[ $i -lt $full_octets ]]; then
+           mask+="255"
+       elif [[ $i -eq $full_octets ]]; then
+           mask+=$((256 - 2**(8-partial_octet)))
+       else
+           mask+="0"
+       fi
+       [[ $i -lt 3 ]] && mask+="."
+   done
+   
+   echo "$mask"
+}
+
+function getNetworkInfo() {
+   local device="${1:-}"
+   local connection_name=""
+   
+   # 如果没有指定设备，获取默认设备
+   if [[ -z "$device" ]]; then
+       device=$(ip route | grep default | awk '{print $5}' | head -n1)
+       if [[ -z "$device" ]]; then
+           logger -l ERROR "Error: Could not determine default network device"
+           return 1
+       fi
+   fi
+   
+   # 获取连接名称
+   connection_name=$(nmcli -t -f GENERAL.CONNECTION device show "$device" 2>/dev/null | cut -d: -f2)
+   if [[ -z "$connection_name" ]]; then
+       logger -l ERROR "Error: Device $device not managed by NetworkManager"
+       return 1
+   fi
+   
+   # 获取IP地址和CIDR
+   local ip_cidr=$(nmcli -t -f IP4.ADDRESS device show "$device" 2>/dev/null | head -n1 | cut -d: -f2)
+   local ip_address=""
+   local subnet_mask=""
+   local cidr=""
+   
+   if [[ -n "$ip_cidr" ]]; then
+       ip_address=$(echo "$ip_cidr" | cut -d/ -f1)
+       cidr=$(echo "$ip_cidr" | cut -d/ -f2)
+       subnet_mask=$(cidr2netmask "$cidr")
+   fi
+   
+   # 获取网关
+   local gateway=$(nmcli -t -f IP4.GATEWAY device show "$device" 2>/dev/null | cut -d: -f2)
+   
+   # 获取DNS
+   local dns_servers=$(nmcli -t -f IP4.DNS device show "$device" 2>/dev/null | cut -d: -f2 | tr '\n' ',' | sed 's/,$//')
+   
+   # 获取配置模式
+   local ip_method=$(nmcli -t -f IPV4.METHOD connection show "$connection_name" 2>/dev/null | cut -d: -f2)
+   local mode="Unknown"
+   case "$ip_method" in
+       auto) mode="DHCP" ;;
+       manual) mode="Static" ;;
+       disabled) mode="Disabled" ;;
+       *) mode="$ip_method" ;;
+   esac
+
+   logger -l INFO "Network Detail as follow: "
+   # 打印表格
+   local w1=15 w2=30
+   printf "+%s+%s+\n" "$(printf '%*s' $((w1+w2+1)) '' | tr ' ' '-')"
+   printf "| %-*s | %-*s |\n" "$w1" "Property" "$w2" "Value"
+   printf "+%s+%s+\n" "$(printf '%*s' $((w1+w2+1)) '' | tr ' ' '-')"
+   printf "| %-*s | %-*s |\n" "$w1" "Device" "$w2" "$device"
+   printf "| %-*s | %-*s |\n" "$w1" "Connection" "$w2" "$connection_name"
+   printf "| %-*s | %-*s |\n" "$w1" "IP Address" "$w2" "${ip_address:-N/A}"
+   printf "| %-*s | %-*s |\n" "$w1" "Subnet Mask" "$w2" "${subnet_mask:-N/A}"
+   printf "| %-*s | %-*s |\n" "$w1" "CIDR" "$w2" "/${cidr:-N/A}"
+   printf "| %-*s | %-*s |\n" "$w1" "Gateway" "$w2" "${gateway:-N/A}"
+   printf "| %-*s | %-*s |\n" "$w1" "DNS Servers" "$w2" "${dns_servers:-N/A}"
+   printf "| %-*s | %-*s |\n" "$w1" "Config Mode" "$w2" "$mode"
+   printf "+%s+%s+\n" "$(printf '%*s' $((w1+w2+1)) '' | tr ' ' '-')"
+
+   # 打印ufw信息
+   logger -l INFO "Firewall Detail as follow: "
+   ufw status verbose
+}
+
+function selfCheck {
+    local device="$1"
+    local outterAddr="114.114.114.114"
+
+    if ! ping -c 3 -W 2 $outterAddr &>/dev/null; then
+        logger -l SUCCESS "normally stayed at static mode"
+        return 0
+    else
+        logger -l WARNING "self-check detectded unaccessed network access, reset to dhcp mod..."
+        setDHCPMode "$device"
+        setDHCPUfw
+    fi
+    return 0
+}
+
+# 计时器服务
+function createSystemdTimer {
+local device=$1
+# service单元
+SERVICE_CONTENT="[Unit]
+Description=Network Check Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_PATH} --device $device --mode self-check
+StandardOutput=journal
+StandardError=journal"
+
+# timer 单元
+TIMER_CONTENT="[Unit]
+Description=Run Network Check Every Minute
+Requires=${SCRIPT_NAME}.service
+
+[Timer]
+OnCalendar=*:*:00
+OnBootSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target"
+
+# 没有服务单元文件就创建
+if [[ -f "$SERVICE_FILE" ]]; then
+    logger -l WARNING "Service already exists: $SERVICE_FILE"
+    return 0
+else
+    logger -l INFO "Creating Service: $SERVICE_FILE"
+    echo "$SERVICE_CONTENT" > "$SERVICE_FILE"
+fi
+
+# 没有计时器单元文件就创建
+if [[ -f "$TIMER_FILE" ]]; then
+    logger -l WARNING "Timer aleady: $TIMER_FILE"
+else
+    logger -l INFO "Creating Timer: $TIMER_FILE"
+    echo "$TIMER_CONTENT" > "$TIMER_FILE"
+fi
+
+systemctl daemon-reload
 
 }
 
+function startTimer {
+    local device=$1
+
+    # 创建计时器服务
+    createSystemdTimer "$device"
+    # 启动计时器服务
+    systemctl enable "$SCRIPT_NAME.timer" --now
+    # 检查状态
+    if [[ $? -eq 0 ]]; then
+        logger -l INFO "Timer started successfully"
+        status
+    else
+        logger -l ERROR "Failed to start timer"
+        return 1
+    fi
+
+    return 0
+}    
+
+function stopTimer {
+    local device=$1
+    logger -l INFO "Stopping timer"
+    # 终止计时器服务
+    systemctl stop "$SCRIPT_NAME.timer" 2>/dev/null
+    systemctl disable "$SCRIPT_NAME.timer" 2>/dev/null
+    # 删除服务单元
+    rm $SERVICE_FILE
+    rm $TIMER_FILE
+    # 检查状态
+    if [[ $? -eq 0 ]]; then
+        logger -l INFO "Timer stopped successfully"
+        status
+    else
+        log_error "Failed to stop timer"
+        return 1
+    fi
+}
+
 function main {
-    local device="${1:-eth0}"
+    local device="eth0"
+    local cornOn=0
+    local mode="dhcp"
 
     # 初始化
     initBackup
@@ -355,10 +679,72 @@ function main {
     # 执行检查
     checkRoot || return 1
     checkEnv || return 1
-    checkEthDevices "$device" || return 1
 
     # 备份当前配置
     backupCurrentConfig "$device"
 
-
+    # 主逻辑
+    while [[ $# -gt 0 ]]; do 
+        case $1 in 
+            --device)
+                device="$2"
+                shift 2
+                ;;
+            --on-self-check)
+                checkEthDevices "$device" || return 1
+                startTimer "$device"
+                shift 2
+                ;;
+            --off-self-check)
+                checkEthDevices "$device" || return 1
+                stopTimer "$device"
+                shift 2
+                ;;
+            --dhcp-mode)
+                checkEthDevices "$device" || return 1
+                setDHCPMode "$device"
+                setDHCPUfw
+                getNetworkInfo "$device"
+                shift 2
+                ;;
+            --static-mode)
+                checkEthDevices "$device" || return 1
+                setStaticMode "$device"
+                setStaticUfw
+                getNetworkInfo "$device"
+                shift 2
+                ;;
+            --self-check)
+                checkEthDevices "$device" || return 1
+                selfCheck "$device"
+                shift 2
+                ;;
+            --net-info)
+                getNetworkInfo "$device"
+                shift 2
+                ;;
+            --help|-h)
+                # 显示help
+                exit 0
+                ;;
+            *)
+                # 显示help
+                exit 0
+                ;;
+        esac
+    done
 }
+
+# 入口
+
+cat << "EOF"
+ ________   _______    ________   ________   ________   ________   ___  __       
+|\   __  \ |\  ___ \  |\   ___ \ |\   __  \ |\   __  \ |\   ____\ |\  \|\  \     
+\ \  \|\  \\ \   __/| \ \  \_|\ \\ \  \|\  \\ \  \|\  \\ \  \___| \ \  \/  /|_   
+ \ \   _  _\\ \  \_|/__\ \  \ \\ \\ \   _  _\\ \  \\\  \\ \  \     \ \   ___  \  
+  \ \  \\  \|\ \  \_|\ \\ \  \_\\ \\ \  \\  \|\ \  \\\  \\ \  \____ \ \  \\ \  \ 
+   \ \__\\ _\ \ \_______\\ \_______\\ \__\\ _\ \ \_______\\ \_______\\ \__\\ \__\
+    \|__|\|__| \|_______| \|_______| \|__|\|__| \|_______| \|_______| \|__| \|__|
+EOF
+echo "Redrock-SRE-2026-Ops-Winter-Assessment/Ops";
+main 
