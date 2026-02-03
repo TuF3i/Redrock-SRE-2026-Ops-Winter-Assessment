@@ -1178,4 +1178,4 @@ cat << "EOF"
     \|__|\|__| \|_______| \|_______| \|__|\|__| \|_______| \|_______| \|__| \|__|
 EOF
 echo "Redrock-SRE-2026-Ops-Winter-Assessment/Ops";
-main 
+main "$@"
